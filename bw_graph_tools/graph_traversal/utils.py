@@ -1,5 +1,5 @@
 import numpy as np
-from bw2calc import PYPARDISO, LCA, spsolve
+from bw2calc import LCA, spsolve
 from scipy.sparse import spmatrix
 
 from bw_graph_tools.graph_traversal.graph_objects import Node
@@ -9,16 +9,10 @@ class CachingSolver:
     """Class which caches cumulative LCA scores during graph traversal.
 
     ``_score_cache`` stores per-unit *cumulative LCA scores* (scalars) keyed by product index.
-    The graph traversal only needs cumulative scores, not full supply vectors, so the batched
-    ``scores`` method solves for several products at once following the same strategy as
-    ``bw2calc.FastSupplyArraysMixin``:
-
-    * With PARDISO (``pypardiso``), all requested products are solved in a single
-      multi-right-hand-side ``spsolve`` call, which reuses the cached factorization and is much
-      faster than solving one product at a time.
-    * Otherwise (UMFPACK / SuperLU), a single multi-right-hand-side solve is *slower* than reusing
-      a cached factorization, so the LCA's technosphere matrix is decomposed once (via
-      ``decompose_technosphere``) and each product is solved iteratively through ``lca.solver``.
+    The graph traversal only needs these scores, not full supply vectors. The score of one unit
+    of product ``i`` is ``score_row @ A^-1 e_i``, which is entry ``i`` of ``A^-T score_row``. So
+    one solve with the transposed technosphere matrix gives the scores of all products at once,
+    instead of one solve per product.
     """
 
     def __init__(self, lca: LCA):
@@ -27,6 +21,8 @@ class CachingSolver:
         # 1-D array of per-activity characterized scores (column sums of the characterized
         # biosphere matrix). Set by `set_score_row` before `scores` is called.
         self.score_row = None
+        # (score_row it was solved for, unit scores of all products)
+        self._all_unit_scores = None
 
     def in_cache(self, indices: set[int]) -> set[int]:
         """Return all `indices` values which already have a cached score."""
@@ -47,7 +43,7 @@ class CachingSolver:
         self.score_row = np.asarray(characterized_biosphere.sum(axis=0)).ravel()
 
     def scores(self, indices: list[int], amounts: list[float]) -> list[float]:
-        """Compute cumulative LCA scores for several products in a single batched solve.
+        """Compute cumulative LCA scores for several products.
 
         Parameters
         ----------
@@ -63,45 +59,21 @@ class CachingSolver:
         """
         missing = [index for index in indices if index not in self._score_cache]
         if missing:
-            if PYPARDISO:
-                unit_scores = self._unit_scores_pardiso(missing)
-            else:
-                unit_scores = self._unit_scores_iterative(missing)
-            for index, score in zip(missing, unit_scores):
+            for index, score in zip(missing, self._unit_scores(missing)):
                 self._score_cache[index] = float(score)
         return [
             self._score_cache[index] * amount for index, amount in zip(indices, amounts)
         ]
 
-    def _unit_scores_pardiso(self, indices: list[int]) -> np.ndarray:
-        """Solve all `indices` in a single multi-right-hand-side PARDISO solve."""
-        matrix = self.lca.technosphere_matrix
-        demand = np.zeros((matrix.shape[0], len(indices)))
-        for column, index in enumerate(indices):
-            demand[index, column] = 1
-        supply = spsolve(matrix, demand)
-        # `spsolve` may squeeze a single right-hand-side down to one dimension.
-        if supply.ndim == 1:
-            supply = supply.reshape(-1, 1)
-        return np.asarray(self.score_row @ supply).ravel()
-
-    def _unit_scores_iterative(self, indices: list[int]) -> np.ndarray:
-        """Solve each of `indices` separately, reusing the LCA's cached factorization.
-
-        A single multi-right-hand-side solve is slower than this under UMFPACK / SuperLU, so we
-        mirror ``bw2calc.FastSupplyArraysMixin._calculate_umfpack``. We make sure the technosphere
-        matrix has been decomposed so that ``solve_linear_system`` reuses ``lca.solver`` instead of
-        re-factorizing on every solve.
-        """
-        if not hasattr(self.lca, "solver"):
-            self.lca.decompose_technosphere()
-        demand = np.zeros(self.lca.technosphere_matrix.shape[0])
-        unit_scores = np.empty(len(indices))
-        for position, index in enumerate(indices):
-            demand[index] = 1
-            unit_scores[position] = self.score_row @ self.lca.solve_linear_system(demand)
-            demand[index] = 0
-        return unit_scores
+    def _unit_scores(self, indices: list[int]) -> np.ndarray:
+        """Unit scores of `indices`, from one solve with the transposed technosphere matrix."""
+        if self._all_unit_scores is None or self._all_unit_scores[0] is not self.score_row:
+            all_unit_scores = spsolve(
+                self.lca.technosphere_matrix.T.tocsr(),
+                np.asarray(self.score_row, dtype=float),
+            )
+            self._all_unit_scores = (self.score_row, np.asarray(all_unit_scores).ravel())
+        return self._all_unit_scores[1][indices]
 
 
 class Counter:
